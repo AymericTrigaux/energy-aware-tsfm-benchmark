@@ -15,7 +15,7 @@ Server Edition GPU, running Linux with world-readable RAPL counters.
 ```bibtex
 @misc{trigaux2026fourorders,
   title  = {Four Orders of Magnitude: Energy-Aware Benchmarking of Time Series Foundation Models},
-  author = {Trigaux, Aymeric and Qaiser and Kazmi},
+  author = {Trigaux, Aymeric and Qaiser, Talia and Kazmi, Hussain Syed},
   year   = {2026},
   note   = {Workshop paper, preprint forthcoming}
 }
