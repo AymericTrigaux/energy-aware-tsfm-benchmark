@@ -1,0 +1,49 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.ipynb_checkpoints/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv*/
+venv/
+env/
+
+# Package / model caches (HuggingFace, uv, generic)
+.cache/
+hf_cache/
+huggingface/
+.huggingface/
+.uv/
+uv_cache/
+uv-cache/
+
+# External model repos (restored separately, see CLAUDE.md)
+lag-llama/
+
+# Data, run outputs, figures, logs — never committed
+data/
+logs/
+figures/
+figures_combined_*.tar.gz
+*.log
+
+# Local Claude Code settings
+.claude/
+
+# results/: ignore everything except the tuned hyperparameters file
+results/*
+!results/tuned_params.json
+
+# Editors / OS
+.vscode/
+.vscode-server/
+.idea/
+.DS_Store
+.AppleDouble
+.LSOverride

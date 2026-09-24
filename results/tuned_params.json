@@ -1,0 +1,13 @@
+{
+  "linear": {
+    "alpha": 34.06457061395274
+  },
+  "lgbm": {
+    "n_estimators": 488,
+    "num_leaves": 121,
+    "learning_rate": 0.035981484767374575,
+    "min_child_samples": 49,
+    "subsample": 0.7779334716558033,
+    "colsample_bytree": 0.826184287797336
+  }
+}

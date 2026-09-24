@@ -1,0 +1,47 @@
+{
+  "data": {
+    "input_path": "data/elia_load.csv",
+    "timestamp_col": "datetime",
+    "target_col": "totalload",
+    "freq": "15T",
+    "timezone": null
+  },
+  "split": {
+    "train_ratio": 0.7,
+    "val_ratio": 0.15,
+    "test_ratio": 0.15
+  },
+  "preprocess": {
+    "enforce_freq": true,
+    "impute_method": "interpolate",
+    "clip_outliers": false
+  },
+  "arima": {
+    "order": [
+      2,
+      1,
+      2
+    ],
+    "seasonal_order": [
+      1,
+      1,
+      1,
+      96
+    ],
+    "trend": "n"
+  },
+  "forecast": {
+    "horizons": [
+      4,
+      96
+    ]
+  },
+  "energy": {
+    "tool": "codecarbon",
+    "country_iso_code": "BEL"
+  },
+  "output": {
+    "results_dir": "results",
+    "models_dir": "models"
+  }
+}

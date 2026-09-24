@@ -1,0 +1,18 @@
+# Core
+numpy
+pandas
+matplotlib
+scikit-learn
+
+# ARIMA/SARIMA + ACF/PACF + ADF test
+statsmodels
+
+# Energy & carbon measurement
+codecarbon
+carbontracker       # complementary tracker: RAPL (Linux) / powermetrics (macOS + sudo)
+
+# Optional: fast parquet IO
+pyarrow
+
+# Optional: progress bars
+tqdm
