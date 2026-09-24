@@ -22,8 +22,8 @@ which commit that was.
 ## How the revisions were recovered
 
 The revisions were **not** recorded at run time — they were reconstructed from the
-Hugging Face cache at `HF_HOME=/volume1/no_backup/r1062653/hf_cache`, which the
-benchmark scripts point at
+`HF_HOME` cache (on Heimdall, `/volume1/no_backup/r1062653/hf_cache`), which the
+benchmark scripts point at by default
 ([`scripts/run_stride2_remaining.sh`](../scripts/run_stride2_remaining.sh)).
 
 Evidence that these are the commits the May 2026 thesis runs actually used:

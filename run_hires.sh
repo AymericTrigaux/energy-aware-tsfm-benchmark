@@ -4,19 +4,18 @@
 # sanity-checks sample density and lag_llama peak power against the cmp2 (1 Hz) run.
 set -uo pipefail
 
-PROJ="/volume1/backup/r1062653/thesis_arima_energy_benchmark"
-VENV="/volume1/no_backup/r1062653/thesis_fm_env"
+PROJ="$(cd "$(dirname "$0")" && pwd)"
+PY="${BENCH_PY:-/volume1/no_backup/r1062653/thesis_fm_env/bin/python}"
 LOG="$PROJ/logs/hires_run.log"
 
 cd "$PROJ"
-# shellcheck disable=SC1091
-source "$VENV/bin/activate"
+export HF_HOME="${HF_HOME:-/volume1/no_backup/r1062653/hf_cache}"
 
 ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
 {
   ts "=== Plan B hi-res (10 Hz, power.draw.instant) run started ==="
-  ts "python: $(command -v python)"
+  ts "python: $PY"
   ts "tag=hires  --nvsmi_interval_ms 100  --cc_poll_interval_s 1.0"
 
   # model:n_origins, in the required order (classical first, then foundation models)
@@ -35,7 +34,7 @@ ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
     m="${entry%%:*}"
     n="${entry##*:}"
     ts ">>> START measure: $m (n_origins=$n)"
-    python power_curves.py measure --model "$m" --n_origins "$n" \
+    "$PY" power_curves.py measure --model "$m" --n_origins "$n" \
       --nvsmi_interval_ms 100 --cc_poll_interval_s 1.0 --tag hires
     rc=$?
     ts "<<< DONE measure: $m (exit=$rc)"
@@ -43,14 +42,14 @@ ts() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
 
   ts "=== All 8 models finished. Rebuilding thesis figures ==="
   ts ">>> composite -> figures/power_curves_composite.png"
-  python power_curves.py composite --tag hires --out figures/power_curves_composite.png
+  "$PY" power_curves.py composite --tag hires --out figures/power_curves_composite.png
   ts "<<< composite (exit=$?)"
   ts ">>> analyze --tag hires"
-  python power_curves.py analyze --tag hires
+  "$PY" power_curves.py analyze --tag hires
   ts "<<< analyze (exit=$?)"
 
   ts "=== Sanity checks (hires vs cmp2) ==="
-  python - <<'PY'
+  "$PY" - <<'PY'
 import glob, os, csv
 
 def newest(pattern):

@@ -36,6 +36,15 @@ figures_combined_*.tar.gz
 # Local Claude Code settings
 .claude/
 
+# Working notes: kept on disk, not published
+CLAUDE.md
+METHODOLOGY.md
+MODELS_STRIDE2_REPORT.md
+PROJECT_REPORT.md
+RESULTS_REPORT.md
+THESIS_REPORT.md
+TSFM_IMPLEMENTATION.md
+
 # results/: ignore everything except the tuned hyperparameters file
 results/*
 !results/tuned_params.json

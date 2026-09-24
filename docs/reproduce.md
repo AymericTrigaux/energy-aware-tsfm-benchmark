@@ -6,15 +6,26 @@ reproduced from what is in this repository, and one figure input no longer exist
 
 ## Environment
 
-All benchmark scripts invoke this interpreter directly:
+Three environment variables locate the interpreter, the model cache and the
+results root. Every `scripts/*.sh` file and `run_hires.sh` sets each one only if
+it is not already set, with the Heimdall value as the default:
 
-```
-/volume1/no_backup/r1062653/thesis_fm_env/bin/python     # Python 3.12.14
+```bash
+export BENCH_PY=/volume1/no_backup/r1062653/thesis_fm_env/bin/python   # Python 3.12.14
+export HF_HOME=/volume1/no_backup/r1062653/hf_cache
+export BENCH_RESULTS="$PWD/results"
 ```
 
-The `.venv` (Python 3.14) described in `CLAUDE.md` **does not exist on this host**;
-`thesis_fm_env` is the environment that produced every result in `results/`.
-Its exact package set is pinned in [`requirements.lock`](../requirements.lock).
+On Heimdall nothing needs to be exported. On any other machine, export these
+three and every script runs unchanged. `BENCH_RESULTS` also sets the default of
+`--results_dir` in `run_benchmark.py`, `run_tsfm_benchmark.py`, `power_curves.py`
+and `scripts/summarise_repeats.py`; `results/tuned_params.json` is repository
+content and is always read from the project directory.
+
+The interpreter behind `BENCH_PY`, `thesis_fm_env`, is the environment that
+produced every result in `results/`. There is no other virtual environment on
+this host. Its exact package set is pinned in
+[`requirements.lock`](../requirements.lock).
 
 ```bash
 # Recreate it
@@ -26,10 +37,9 @@ uv pip install -r requirements.lock
 reproduction — it omits `lightgbm`, `optuna`, `holidays`, `torch`,
 `chronos-forecasting`, `timesfm`, `uni2ts`, `gluonts` and `huggingface_hub`.
 
-Every run needs these environment variables (set by all `scripts/*.sh`):
+Every run also needs these (set by all `scripts/*.sh`):
 
 ```bash
-export HF_HOME=/volume1/no_backup/r1062653/hf_cache
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8
 export PYTHONPATH="$PWD/lag-llama:${PYTHONPATH:-}"     # lag_llama only
@@ -182,9 +192,9 @@ Figures depending on classical energy — including the LightGBM floor in
 metrics that `cmd_unified` reads for its robustness figure
 (`results/classical/20260514_173941_lgbm_naive_etth1/`,
 `results/foundation_models/20260514_174014_chronos_bolt_mini_etth1/`) are absent.
-`cmd_unified` catches this and skips the figure. Note `CLAUDE.md` describes ETTh1 as
-14,400 hours ending 2018-02-20, but the logged run used 17,420 hours ending
-2018-06-26.
+`cmd_unified` catches this and skips the figure. Note that earlier project notes
+described ETTh1 as 14,400 hours ending 2018-02-20; the logged run used 17,420
+hours ending 2018-06-26.
 
 **3. `tune_hyperparams.py` cannot run in the pinned environment.** `optuna` is not
 installed in `thesis_fm_env` and so is absent from `requirements.lock`. Separately,
@@ -203,9 +213,8 @@ format is identical and `uv pip install -r requirements.lock` consumes it direct
 
 ## Repository naming
 
-`CLAUDE.md` refers to three files that do not exist under those names:
+Earlier project notes refer to files that do not exist under those names:
 `src/tsfm_models.py` is `src/models_tsfm.py`; `prepare_dataset.py` and
 `prepare_etth1.py` are absent (only `prepare_data.py`); and
 `plot_power_curves_composite.py`, `measure_power_curve.py` and
-`analyze_power_curves.py` referenced in `THESIS_REPORT.md` were folded into
-`power_curves.py` subcommands.
+`analyze_power_curves.py` were folded into `power_curves.py` subcommands.

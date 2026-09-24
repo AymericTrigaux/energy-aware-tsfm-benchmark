@@ -151,7 +151,7 @@ def parse_args() -> argparse.Namespace:
                         "eval phase), in seconds. Only used with --rapl and without "
                         "--bmc; with --bmc the RAPL meter shares the BMC windows.")
 
-    p.add_argument("--results_dir", default="results",
+    p.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"),
                    help="Root directory for output files.")
     p.add_argument("--no_plots", action="store_true",
                    help="Skip forecast plot generation.")

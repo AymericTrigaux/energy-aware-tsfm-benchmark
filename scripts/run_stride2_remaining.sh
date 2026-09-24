@@ -11,14 +11,14 @@ set -uo pipefail
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$PROJECT_DIR"
 
-export HF_HOME=/volume1/no_backup/r1062653/hf_cache
+export HF_HOME="${HF_HOME:-/volume1/no_backup/r1062653/hf_cache}"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8 OPENBLAS_NUM_THREADS=8
 export PYTHONPATH="$PROJECT_DIR/lag-llama:${PYTHONPATH:-}"
 
-PY=/volume1/no_backup/r1062653/thesis_fm_env/bin/python
+PY="${BENCH_PY:-/volume1/no_backup/r1062653/thesis_fm_env/bin/python}"
 TS=$(date -u +%Y%m%d_%H%M%S)
-ROOT="$PROJECT_DIR/results/stride2_remaining_${TS}"
+ROOT="${BENCH_RESULTS:-$PROJECT_DIR/results}/stride2_remaining_${TS}"
 mkdir -p "$ROOT" logs/stride2_remaining
 LOG="logs/stride2_remaining/${TS}.log"
 echo "tag=$TS  root=$ROOT" | tee -a "$LOG"

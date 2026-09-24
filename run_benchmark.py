@@ -113,7 +113,7 @@ def parse_args() -> argparse.Namespace:
                         "--bmc; with --bmc the RAPL meter shares the BMC windows.")
 
     # Output
-    p.add_argument("--results_dir", default="results")
+    p.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     p.add_argument("--no_plots", action="store_true",
                    help="Skip plot generation (faster for headless runs).")
     p.add_argument("--dpi", type=int, default=100)

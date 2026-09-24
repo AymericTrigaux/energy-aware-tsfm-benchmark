@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--root", default=None,
                    help="Repeats root directory. Defaults to the newest results/repeats_*.")
-    p.add_argument("--results_dir", default="results",
+    p.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"),
                    help="Where to look for repeats_* when --root is omitted.")
     p.add_argument("--horizon", type=int, default=96,
                    help="Horizon (in steps) whose MAE is summarised.")

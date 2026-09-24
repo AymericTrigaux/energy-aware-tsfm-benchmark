@@ -729,7 +729,7 @@ def main() -> None:
     pm.add_argument("--gpu_index", default="0")
     pm.add_argument("--no_cc", action="store_true")
     pm.add_argument("--no_nvsmi", action="store_true")
-    pm.add_argument("--results_dir", default="results")
+    pm.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     pm.add_argument("--tag", default=None)
     pm.add_argument("--no_plot", action="store_true")
     pm.add_argument("--dpi", type=int, default=120)
@@ -738,7 +738,7 @@ def main() -> None:
     pa = sub.add_parser("analyze", help="Post-process power-curve runs")
     pa.add_argument("--tag", nargs="+", default=["cmp2", "dense"])
     pa.add_argument("--sweep_tag_prefix", default="sweep_n")
-    pa.add_argument("--results_dir", default="results")
+    pa.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     pa.add_argument("--out_dir", default="figures")
     pa.add_argument("--dpi", type=int, default=150)
     pa.add_argument("--lag_llama_batch_size", type=int, default=4)
@@ -746,7 +746,7 @@ def main() -> None:
     # composite
     pc = sub.add_parser("composite", help="Compose per-model power curves into one figure")
     pc.add_argument("--tag", nargs="+", default=["cmp2"])
-    pc.add_argument("--results_dir", default="results")
+    pc.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     pc.add_argument("--out", default="figures/power_curves_composite.png")
     # 300 dpi for print; a sibling .pdf is written alongside the .png.
     pc.add_argument("--dpi", type=int, default=300)
