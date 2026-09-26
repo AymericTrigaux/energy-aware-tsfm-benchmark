@@ -38,6 +38,21 @@ Also reported per model, when the columns are present in metrics.csv:
               RAPL access and are treated as cpu_load, so old and new rows sit
               in one table.
 
+  * ct_used — whether CarbonTracker entered the CC/CT mean.  Rows whose
+              ct_cpu_avg_w is empty (CarbonTracker had no CPU sample, e.g. the
+              sub-second naive eval) use CodeCarbon alone for both the eval and
+              the fit+eval per-origin figures.
+  * bmc_incremental_uwh_per_origin / rapl_incremental_uwh_per_origin —
+              marginal chassis / socket energy per forecast origin,
+              incremental_kwh / n_predictions * 1e9.
+  * Host conditions — per model, min / max across repeats of the 1-min load
+              average and GPU utilisation at run start and end, and of the two
+              baseline power stds.  A model is flagged with '*' when any repeat
+              started or ended with load1 > 8 (the host_idle_check threshold).
+
+--markdown <path> writes every summary table (not the per-repeat rows) as
+GitHub Markdown tables to that file, in addition to the stdout output.
+
 std is the sample standard deviation (ddof=1); it is undefined for n < 2 and
 printed as "n/a".
 
@@ -71,6 +86,8 @@ def parse_args() -> argparse.Namespace:
                    help="Horizon (in steps) whose MAE is summarised.")
     p.add_argument("--csv", default=None,
                    help="Optional path to also write the per-repeat rows as CSV.")
+    p.add_argument("--markdown", default=None,
+                   help="Optional path to also write every summary table as GitHub Markdown.")
     return p.parse_args()
 
 
@@ -122,10 +139,13 @@ def _cc_split(rep_dir: str, cc_cpu_mode: Optional[str]) -> Dict[str, float]:
     return out
 
 
-def _mean_of_backends(row: pd.Series, cc_col: str, ct_col: str) -> float:
-    """mean(CC, CT), skipping backends that are missing or non-positive."""
+def _mean_of_backends(row: pd.Series, cc_col: str, ct_col: Optional[str]) -> float:
+    """mean(CC, CT), skipping backends that are missing or non-positive.
+
+    Pass ct_col=None to use CodeCarbon alone (CarbonTracker had no CPU sample).
+    """
     vals = []
-    for col in (cc_col, ct_col):
+    for col in (c for c in (cc_col, ct_col) if c is not None):
         v = row.get(col, np.nan)
         if pd.notna(v) and float(v) > 0:
             vals.append(float(v))
@@ -173,8 +193,17 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
             print(f"  [warn] {model} rep{meta.get('repeat_index')}: n_predictions={n_pred} — skipped")
             continue
 
-        eval_kwh = _mean_of_backends(r, "eval_cc_energy_kwh", "eval_ct_energy_kwh")
-        fit_kwh = _mean_of_backends(r, "fit_cc_energy_kwh", "fit_ct_energy_kwh")
+        # CarbonTracker enters the mean only when it actually sampled the CPU
+        # in this run (ct_cpu_avg_w present); otherwise CodeCarbon alone.
+        ct_raw = r.get("ct_cpu_avg_w")
+        try:
+            ct_used = bool(pd.notna(ct_raw) and np.isfinite(float(ct_raw)))
+        except (TypeError, ValueError):
+            ct_used = False
+        eval_kwh = _mean_of_backends(r, "eval_cc_energy_kwh",
+                                     "eval_ct_energy_kwh" if ct_used else None)
+        fit_kwh = _mean_of_backends(r, "fit_cc_energy_kwh",
+                                    "fit_ct_energy_kwh" if ct_used else None)
         # Zero-shot FMs log fit energy as exactly 0.0, which _mean_of_backends
         # reads as "absent"; a genuinely absent fit is also 0 for this purpose.
         fit_kwh = 0.0 if np.isnan(fit_kwh) else fit_kwh
@@ -225,6 +254,16 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
             "cc_measured_kwh":  cc_split["cc_measured_kwh"],
             "cc_modelled_kwh":  cc_split["cc_modelled_kwh"],
             "measured_fraction": cc_split["measured_fraction"],
+            # --- appended columns ---
+            "ct_used":          ct_used,
+            # Marginal energy per forecast origin from the two chassis meters.
+            "bmc_incremental_uwh_per_origin":  _f("bmc_incremental_kwh") / n_pred * 1e9,
+            "rapl_incremental_uwh_per_origin": _f("rapl_incremental_kwh") / n_pred * 1e9,
+            # Host conditions at run start / end, as logged by the runners.
+            "host_load1_start":        _f("host_load1_start"),
+            "host_load1_end":          _f("host_load1_end"),
+            "host_gpu_util_pct_start": _f("host_gpu_util_pct_start"),
+            "host_gpu_util_pct_end":   _f("host_gpu_util_pct_end"),
         })
 
     return pd.DataFrame(rows)
@@ -247,7 +286,18 @@ def _fmt(v: float, width: int, prec: int) -> str:
     return f"{'n/a':>{width}}" if not np.isfinite(v) else f"{v:>{width}.{prec}f}"
 
 
-def summarise(per_repeat: pd.DataFrame, horizon: int) -> None:
+def _md_table(header: List[str], rows: List[List[str]]) -> str:
+    """Render one GitHub Markdown table."""
+    out = ["| " + " | ".join(header) + " |",
+           "|" + "|".join("---" for _ in header) + "|"]
+    for row in rows:
+        out.append("| " + " | ".join(str(c).strip() for c in row) + " |")
+    return "\n".join(out)
+
+
+def summarise(per_repeat: pd.DataFrame, horizon: int,
+              md: Optional[List[str]] = None) -> None:
+    """Print every summary table; when `md` is a list, also append Markdown to it."""
     mae_col = f"MAE_h{horizon}"
 
     for title, col, unit, prec in [
@@ -273,6 +323,9 @@ def summarise(per_repeat: pd.DataFrame, horizon: int) -> None:
         ("CodeCarbon — measured kWh (gpu [+cpu if RAPL])", "cc_measured_kwh", "kWh", 8),
         ("CodeCarbon — modelled kWh (ram [+cpu if cpu_load])", "cc_modelled_kwh", "kWh", 8),
         ("CodeCarbon — measured fraction (measured/total)", "measured_fraction", "0-1", 4),
+        # --- appended tables ---
+        ("BMC — incremental energy per origin", "bmc_incremental_uwh_per_origin", "uWh / origin", 4),
+        ("RAPL — incremental energy per origin", "rapl_incremental_uwh_per_origin", "uWh / origin", 4),
     ]:
         if col in per_repeat.columns and per_repeat[col].notna().sum() == 0:
             continue  # nothing measured for this column — skip the empty table
@@ -282,24 +335,36 @@ def summarise(per_repeat: pd.DataFrame, horizon: int) -> None:
         print("=" * 86)
         print(f"{'model':<20} {'n':>3} {'mean':>14} {'std':>14} {'min':>14} {'max':>14}")
         print("-" * 86)
+        md_rows: List[List[str]] = []
         for model, grp in per_repeat.groupby("model", sort=False):
             s = _stats(grp[col].to_numpy(dtype=float))
-            print(f"{model:<20} {s['n']:>3} "
-                  f"{_fmt(s['mean'], 14, prec)} {_fmt(s['std'], 14, prec)} "
-                  f"{_fmt(s['min'], 14, prec)} {_fmt(s['max'], 14, prec)}")
+            cells = [_fmt(s['mean'], 14, prec), _fmt(s['std'], 14, prec),
+                     _fmt(s['min'], 14, prec), _fmt(s['max'], 14, prec)]
+            print(f"{model:<20} {s['n']:>3} " + " ".join(cells))
+            md_rows.append([model, str(s['n'])] + cells)
         print("=" * 86)
+        if md is not None:
+            md.append(f"### {title} [{unit}]\n\n"
+                      + _md_table(["model", "n", "mean", "std", "min", "max"], md_rows))
 
     # Relative spread is what the variance question is actually about.
     print()
     print("Relative spread  (std / mean, %)")
     print("-" * 86)
-    print(f"{'model':<20} {'eval energy':>14} {'fit+eval energy':>18} {f'MAE h={horizon}':>14} "
-          f"{'BMC gross':>12} {'BMC increm.':>12} {'RAPL gross':>12} {'RAPL increm.':>12}")
+    rel_header = ["eval energy", "fit+eval energy", f"MAE h={horizon}",
+                  "BMC gross", "BMC increm.", "RAPL gross", "RAPL increm.",
+                  "BMC incr./origin", "RAPL incr./origin"]
+    rel_cols = ("eval_uwh_per_origin", "total_uwh_per_origin", mae_col,
+                "bmc_gross", "bmc_incremental", "rapl_gross", "rapl_incremental",
+                "bmc_incremental_uwh_per_origin", "rapl_incremental_uwh_per_origin")
+    print(f"{'model':<20} {rel_header[0]:>14} {rel_header[1]:>18} {rel_header[2]:>14} "
+          f"{rel_header[3]:>12} {rel_header[4]:>12} {rel_header[5]:>12} {rel_header[6]:>12} "
+          f"{rel_header[7]:>17} {rel_header[8]:>18}")
     print("-" * 86)
+    rel_md_rows: List[List[str]] = []
     for model, grp in per_repeat.groupby("model", sort=False):
         cells = []
-        for col in ("eval_uwh_per_origin", "total_uwh_per_origin", mae_col,
-                    "bmc_gross", "bmc_incremental", "rapl_gross", "rapl_incremental"):
+        for col in rel_cols:
             if col not in grp.columns:
                 cells.append(np.nan)
                 continue
@@ -308,8 +373,49 @@ def summarise(per_repeat: pd.DataFrame, horizon: int) -> None:
             cells.append(rel)
         print(f"{model:<20} {_fmt(cells[0], 14, 2)} {_fmt(cells[1], 18, 2)} "
               f"{_fmt(cells[2], 14, 2)} {_fmt(cells[3], 12, 2)} {_fmt(cells[4], 12, 2)} "
-              f"{_fmt(cells[5], 12, 2)} {_fmt(cells[6], 12, 2)}")
+              f"{_fmt(cells[5], 12, 2)} {_fmt(cells[6], 12, 2)} "
+              f"{_fmt(cells[7], 17, 2)} {_fmt(cells[8], 18, 2)}")
+        rel_md_rows.append([model] + [_fmt(c, 1, 2) for c in cells])
     print("-" * 86)
+    if md is not None:
+        md.append("### Relative spread (std / mean, %)\n\n"
+                  + _md_table(["model"] + rel_header, rel_md_rows))
+
+    # Host conditions: was the machine quiet while each model's repeats ran?
+    host_cols = [("host_load1_start", "load1 start", 2),
+                 ("host_load1_end", "load1 end", 2),
+                 ("host_gpu_util_pct_start", "GPU% start", 1),
+                 ("host_gpu_util_pct_end", "GPU% end", 1),
+                 ("bmc_baseline_std_w", "BMC base std W", 2),
+                 ("rapl_baseline_std_w", "RAPL base std W", 2)]
+    if any(c in per_repeat.columns and per_repeat[c].notna().any() for c, _, _ in host_cols):
+        print()
+        print("Host conditions per model  (min / max across repeats; * = load1 > 8 in any repeat)")
+        print("-" * 86)
+        print(f"{'model':<21} " + " ".join(f"{lab + ' min':>15} {lab + ' max':>15}" for _, lab, _ in host_cols))
+        print("-" * 86)
+        host_md_rows: List[List[str]] = []
+        for model, grp in per_repeat.groupby("model", sort=False):
+            flag = ""
+            for c in ("host_load1_start", "host_load1_end"):
+                if c in grp.columns and (grp[c].to_numpy(dtype=float) > 8).any():
+                    flag = "*"
+            cells: List[str] = []
+            for c, _, prec in host_cols:
+                if c in grp.columns:
+                    s = _stats(grp[c].to_numpy(dtype=float))
+                    cells += [_fmt(s["min"], 15, prec), _fmt(s["max"], 15, prec)]
+                else:
+                    cells += [_fmt(np.nan, 15, prec), _fmt(np.nan, 15, prec)]
+            print(f"{model + flag:<21} " + " ".join(cells))
+            host_md_rows.append([model + flag] + cells)
+        print("-" * 86)
+        if md is not None:
+            hdr = ["model"]
+            for _, lab, _ in host_cols:
+                hdr += [f"{lab} min", f"{lab} max"]
+            md.append("### Host conditions per model (min / max across repeats; * = load1 > 8 in any repeat)\n\n"
+                      + _md_table(hdr, host_md_rows))
 
 
 def main() -> None:
@@ -335,7 +441,17 @@ def main() -> None:
     print("-" * 86)
     print(per_repeat.to_string(index=False))
 
-    summarise(per_repeat, args.horizon)
+    md: Optional[List[str]] = [] if args.markdown else None
+    summarise(per_repeat, args.horizon, md)
+
+    if args.markdown:
+        os.makedirs(os.path.dirname(args.markdown) or ".", exist_ok=True)
+        with open(args.markdown, "w", encoding="utf-8") as fh:
+            fh.write(f"# Repeats summary\n\nRoot: `{root}`  \n"
+                     f"Horizon: h={args.horizon}  \n"
+                     f"Repeats: {len(per_repeat)} across {n_models} model(s)\n\n")
+            fh.write("\n\n".join(md or []) + "\n")
+        print(f"\nSummary tables written to {args.markdown}")
 
     if args.csv:
         os.makedirs(os.path.dirname(args.csv) or ".", exist_ok=True)
