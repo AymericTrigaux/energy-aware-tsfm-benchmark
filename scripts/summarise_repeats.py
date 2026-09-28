@@ -50,6 +50,14 @@ Also reported per model, when the columns are present in metrics.csv:
               baseline power stds.  A model is flagged with '*' when any repeat
               started or ended with load1 > 8 (the host_idle_check threshold).
 
+--baseline {both,before} chooses the idle baseline for the two incremental
+figures.  "both" (default) keeps the meters' own values, whose baseline is the
+mean of the before- and after-window.  "before" recomputes bmc_incremental and
+rapl_incremental from the run's bmc_power.csv / rapl_power.csv traces with the
+before-window alone as baseline, using the meters' dt-weighted integral
+(sum of max(P - baseline, 0) * dt over the run phase).  Use it for long GPU
+runs, where the after-window still carries the chassis' cool-down.
+
 --markdown <path> writes every summary table (not the per-repeat rows) as
 GitHub Markdown tables to that file, in addition to the stdout output.
 
@@ -86,6 +94,10 @@ def parse_args() -> argparse.Namespace:
                    help="Horizon (in steps) whose MAE is summarised.")
     p.add_argument("--csv", default=None,
                    help="Optional path to also write the per-repeat rows as CSV.")
+    p.add_argument("--baseline", choices=["both", "before"], default="both",
+                   help="Idle baseline for the BMC/RAPL incremental figures: 'both' uses "
+                        "the meters' own before+after mean; 'before' recomputes them from "
+                        "the power traces with the before-window only.")
     p.add_argument("--markdown", default=None,
                    help="Optional path to also write every summary table as GitHub Markdown.")
     return p.parse_args()
@@ -139,6 +151,45 @@ def _cc_split(rep_dir: str, cc_cpu_mode: Optional[str]) -> Dict[str, float]:
     return out
 
 
+def _incremental_before_only(run_dir: str, model: str, trace: str, power_col: str,
+                             before_phase: str) -> Dict[str, float]:
+    """Recompute incremental kWh from a power trace, baseline = before-window only.
+
+    Same integral as the meters: sum of max(P - baseline, 0) * dt over the run
+    phase, where dt is the time since the previous sample in the trace (the
+    phase-switch sample closes the before-window, so the first run interval
+    starts at the switch instant).
+    """
+    nan = float("nan")
+    out = {"incremental_kwh": nan, "baseline_w": nan, "baseline_std_w": nan}
+    path = os.path.join(run_dir, trace)
+    if not os.path.exists(path):
+        return out
+    try:
+        t = pd.read_csv(path)
+    except Exception:
+        return out
+    if "project_name" in t.columns:
+        sel = t[t["project_name"].astype(str).str.endswith(f"_{model}_eval")]
+        if not sel.empty:
+            t = sel
+    if power_col not in t.columns or "timestamp_s" not in t.columns or t.empty:
+        return out
+    t = t.reset_index(drop=True)
+    dt = t["timestamp_s"].diff().fillna(0.0).clip(lower=0.0)
+    before = t.loc[t["phase"] == before_phase, power_col].to_numpy(dtype=float)
+    run = t["phase"] == "run"
+    if len(before) == 0 or not run.any():
+        return out
+    base = float(np.mean(before))
+    joules = float((np.maximum(t.loc[run, power_col].to_numpy(dtype=float) - base, 0.0)
+                    * dt[run].to_numpy(dtype=float)).sum())
+    out["incremental_kwh"] = joules / 3.6e6
+    out["baseline_w"] = base
+    out["baseline_std_w"] = float(np.std(before, ddof=1)) if len(before) > 1 else nan
+    return out
+
+
 def _mean_of_backends(row: pd.Series, cc_col: str, ct_col: Optional[str]) -> float:
     """mean(CC, CT), skipping backends that are missing or non-positive.
 
@@ -152,7 +203,7 @@ def _mean_of_backends(row: pd.Series, cc_col: str, ct_col: Optional[str]) -> flo
     return float(np.mean(vals)) if vals else float("nan")
 
 
-def collect(root: str, horizon: int) -> pd.DataFrame:
+def collect(root: str, horizon: int, baseline: str = "both") -> pd.DataFrame:
     """One row per repeat."""
     rows: List[dict] = []
 
@@ -219,6 +270,24 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
         cc_cpu_mode = str(cc_cpu_mode) if pd.notna(cc_cpu_mode) else None
         cc_split = _cc_split(rep_dir, cc_cpu_mode)
 
+        # Incremental energy: the meters' own value, or recomputed from the
+        # traces with the before-window as the only baseline.
+        bmc_incr = _f("bmc_incremental_kwh")
+        rapl_incr = _f("rapl_incremental_kwh")
+        bmc_b = {"baseline_w": float("nan"), "baseline_std_w": float("nan")}
+        rapl_b = dict(bmc_b)
+        if baseline == "before":
+            run_dir = os.path.dirname(metrics[0])
+            mkey = str(model).lower().strip()
+            bmc_b = _incremental_before_only(run_dir, mkey, "bmc_power.csv",
+                                             "power_w", "baseline_before")
+            rapl_b = _incremental_before_only(run_dir, mkey, "rapl_power.csv",
+                                              "sum_w", "before")
+            bmc_incr, rapl_incr = bmc_b["incremental_kwh"], rapl_b["incremental_kwh"]
+            if np.isnan(bmc_incr) and np.isnan(rapl_incr):
+                print(f"  [warn] {model} rep{meta.get('repeat_index')}: no usable power "
+                      f"trace for --baseline before")
+
         rows.append({
             "model":            model,
             "repeat_index":     meta.get("repeat_index"),
@@ -233,7 +302,7 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
             f"MAE_h{horizon}":  float(r["MAE"]),
             # Whole-chassis BMC measurement (present only for --bmc runs).
             "bmc_gross":        _f("bmc_gross_kwh"),
-            "bmc_incremental":  _f("bmc_incremental_kwh"),
+            "bmc_incremental":  bmc_incr,
             "bmc_baseline_w":   _f("bmc_baseline_w"),
             "bmc_baseline_std_w": _f("bmc_baseline_std_w"),
             "bmc_mean_w":       _f("bmc_mean_w"),
@@ -241,7 +310,7 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
             "bmc_run_window_s": _f("bmc_run_window_s"),
             # Socket CPU measurement via RAPL (present only for --rapl runs).
             "rapl_gross":       _f("rapl_gross_kwh"),
-            "rapl_incremental": _f("rapl_incremental_kwh"),
+            "rapl_incremental": rapl_incr,
             "rapl_baseline_w":  _f("rapl_baseline_w"),
             "rapl_baseline_std_w": _f("rapl_baseline_std_w"),
             "rapl_mean_w":      _f("rapl_mean_w"),
@@ -257,13 +326,20 @@ def collect(root: str, horizon: int) -> pd.DataFrame:
             # --- appended columns ---
             "ct_used":          ct_used,
             # Marginal energy per forecast origin from the two chassis meters.
-            "bmc_incremental_uwh_per_origin":  _f("bmc_incremental_kwh") / n_pred * 1e9,
-            "rapl_incremental_uwh_per_origin": _f("rapl_incremental_kwh") / n_pred * 1e9,
+            "bmc_incremental_uwh_per_origin":  bmc_incr / n_pred * 1e9,
+            "rapl_incremental_uwh_per_origin": rapl_incr / n_pred * 1e9,
             # Host conditions at run start / end, as logged by the runners.
             "host_load1_start":        _f("host_load1_start"),
             "host_load1_end":          _f("host_load1_end"),
             "host_gpu_util_pct_start": _f("host_gpu_util_pct_start"),
             "host_gpu_util_pct_end":   _f("host_gpu_util_pct_end"),
+            # Which baseline the incremental figures use, and the before-only
+            # baseline statistics when they were recomputed from the traces.
+            "baseline_mode":           baseline,
+            "bmc_baseline_before_w":       bmc_b["baseline_w"],
+            "bmc_baseline_before_std_w":   bmc_b["baseline_std_w"],
+            "rapl_baseline_before_w":      rapl_b["baseline_w"],
+            "rapl_baseline_before_std_w":  rapl_b["baseline_std_w"],
         })
 
     return pd.DataFrame(rows)
@@ -423,13 +499,16 @@ def main() -> None:
     root = args.root or _newest_root(args.results_dir)
     print(f"\nRepeats root: {root}")
 
-    per_repeat = collect(root, args.horizon)
+    per_repeat = collect(root, args.horizon, args.baseline)
     if per_repeat.empty:
         raise SystemExit("No usable repeats found — nothing to summarise.")
 
     n_models = per_repeat["model"].nunique()
     print(f"Collected {len(per_repeat)} repeat(s) across {n_models} model(s), "
           f"horizon h={args.horizon}")
+    print(f"Incremental baseline: {args.baseline}"
+          + ("  (recomputed from power traces, before-window only)"
+             if args.baseline == "before" else "  (meters' own, before + after windows)"))
 
     n_pred = sorted(per_repeat["n_predictions"].unique())
     if len(n_pred) > 1:
@@ -449,7 +528,8 @@ def main() -> None:
         with open(args.markdown, "w", encoding="utf-8") as fh:
             fh.write(f"# Repeats summary\n\nRoot: `{root}`  \n"
                      f"Horizon: h={args.horizon}  \n"
-                     f"Repeats: {len(per_repeat)} across {n_models} model(s)\n\n")
+                     f"Repeats: {len(per_repeat)} across {n_models} model(s)  \n"
+                     f"Incremental baseline: {args.baseline}\n\n")
             fh.write("\n\n".join(md or []) + "\n")
         print(f"\nSummary tables written to {args.markdown}")
 
