@@ -150,6 +150,10 @@ def parse_args() -> argparse.Namespace:
                    help="Length of each RAPL baseline window (before and after the "
                         "eval phase), in seconds. Only used with --rapl and without "
                         "--bmc; with --bmc the RAPL meter shares the BMC windows.")
+    p.add_argument("--chassis_cooldown_s", type=float, default=0.0,
+                   help="Pause between the end of the eval phase and the after-baseline "
+                        "of the BMC and RAPL meters, in seconds. Sampled and labelled "
+                        "'cooldown' in both traces, excluded from the baseline.")
 
     p.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"),
                    help="Root directory for output files.")
@@ -546,12 +550,14 @@ def run_model(
         baseline_before_s=args.bmc_baseline_s,
         baseline_after_s=args.bmc_baseline_s,
         enabled=bmc_on,
+        cooldown_s=args.chassis_cooldown_s,
     )
     rapl_eval = RaplPowerMeter(
         eval_tag, run_dir,
         baseline_before_s=args.rapl_baseline_s,
         baseline_after_s=args.rapl_baseline_s,
         enabled=rapl_on,
+        cooldown_s=args.chassis_cooldown_s,
     )
     rapl_eval.start()                       # RAPL phase "before"
     bmc_eval.start()                        # blocks bmc_baseline_s if --bmc
@@ -566,13 +572,13 @@ def run_model(
         n_origins=getattr(args, "n_origins", None),
         batch_size=getattr(args, "batch_size", 1),
     )
-    rapl_eval.end_run()                     # RAPL phase "after": walk-forward + tracker starts only
+    rapl_eval.end_run()                     # RAPL phase "cooldown" then "after"; run = walk-forward + tracker starts only
     eval_energy = _combined(cc_eval, ct_eval, nv_eval)
     cc_cpu_mode = cc_eval.cpu_mode()
     ct_cpu_avg_w = ct_eval.cpu_avg_w()
-    bmc_eval.stop()                         # blocks bmc_baseline_s if --bmc
+    bmc_eval.stop()                         # blocks cooldown + bmc_baseline_s if --bmc
     if rapl_on and not bmc_on:
-        time.sleep(args.rapl_baseline_s)
+        time.sleep(args.chassis_cooldown_s + args.rapl_baseline_s)
     rapl_eval.stop()
     bmc_summary = bmc_eval.summary()
     rapl_summary = rapl_eval.summary()

@@ -43,6 +43,10 @@ TAG=""
 DRY_RUN=0
 SKIP_IDLE_CHECK=0
 BMC_BASELINE_S=60
+# Cool-down between the end of a run and its after-baseline, and the pause
+# between consecutive jobs, so the next before-window is settled.
+CHASSIS_COOLDOWN_S=120
+JOB_PAUSE_S=120
 SKIP_SWEEP=0
 
 # The nine remaining foundation-model variants, each run once with --bmc so that
@@ -117,13 +121,15 @@ estimate_total_s() {
     local total=0 m i n
     for m in "${MODELS[@]}"; do
         n=$(awk -v e="$(may_eval_s "$m")" -v s="$(setup_s "$m")" -v b="$BMC_BASELINE_S" \
-                -v r="$REPEATS" 'BEGIN{printf "%.0f", r*(e+s+2*b)}')
+                -v c="$CHASSIS_COOLDOWN_S" -v p="$JOB_PAUSE_S" \
+                -v r="$REPEATS" 'BEGIN{printf "%.0f", r*(e+s+2*b+c+p)}')
         total=$((total + n))
     done
     if [ "$SKIP_SWEEP" -eq 0 ]; then
         for m in "${SWEEP_MODELS[@]}"; do
             n=$(awk -v e="$(may_eval_s "$m")" -v s="$(setup_s "$m")" -v b="$BMC_BASELINE_S" \
-                    'BEGIN{printf "%.0f", e+s+2*b}')
+                    -v c="$CHASSIS_COOLDOWN_S" -v p="$JOB_PAUSE_S" \
+                    'BEGIN{printf "%.0f", e+s+2*b+c+p}')
             total=$((total + n))
         done
     fi
@@ -134,12 +140,14 @@ print_estimate() {
     local m n sub total
     echo ""
     echo "Estimated wall time (from May 2026 stride-2 eval wall clocks;"
-    echo "each run adds 2 x ${BMC_BASELINE_S}s of BMC baseline sampling):"
+    echo "each run adds 2 x ${BMC_BASELINE_S}s of baseline sampling, ${CHASSIS_COOLDOWN_S}s of"
+    echo "cool-down and a ${JOB_PAUSE_S}s pause before the next job):"
     printf "  %-20s %8s %6s %12s\n" MODEL "MAY_EVAL" "RUNS" "EST"
     printf "  %s\n" "------------------------------------------------------"
     for m in "${MODELS[@]}"; do
         sub=$(awk -v e="$(may_eval_s "$m")" -v s="$(setup_s "$m")" -v b="$BMC_BASELINE_S" \
-                  -v r="$REPEATS" 'BEGIN{printf "%.0f", r*(e+s+2*b)}')
+                  -v c="$CHASSIS_COOLDOWN_S" -v p="$JOB_PAUSE_S" \
+                  -v r="$REPEATS" 'BEGIN{printf "%.0f", r*(e+s+2*b+c+p)}')
         printf "  %-20s %7ss %6s %10.1f m\n" "$m" "$(may_eval_s "$m")" "$REPEATS" \
                "$(awk -v v="$sub" 'BEGIN{print v/60}')"
     done
@@ -147,7 +155,8 @@ print_estimate() {
         printf "  %s\n" "--- BMC coverage sweep (1 run each) -------------------"
         for m in "${SWEEP_MODELS[@]}"; do
             sub=$(awk -v e="$(may_eval_s "$m")" -v s="$(setup_s "$m")" -v b="$BMC_BASELINE_S" \
-                      'BEGIN{printf "%.0f", e+s+2*b}')
+                      -v c="$CHASSIS_COOLDOWN_S" -v p="$JOB_PAUSE_S" \
+                      'BEGIN{printf "%.0f", e+s+2*b+c+p}')
             printf "  %-20s %7ss %6s %10.1f m\n" "$m" "$(may_eval_s "$m")" "1" \
                    "$(awk -v v="$sub" 'BEGIN{print v/60}')"
         done
@@ -188,6 +197,7 @@ LOG="logs/repeats/${TS}${SUFFIX}.log"
     echo "root=$ROOT"
     echo "models=${MODELS[*]}  repeats=$REPEATS  stride=$STRIDE  test_years=$TEST_YEARS  horizons=$HORIZONS"
     echo "bmc=on  bmc_baseline_s=$BMC_BASELINE_S"
+    echo "chassis_cooldown_s=$CHASSIS_COOLDOWN_S  job_pause_s=$JOB_PAUSE_S"
     if [ "$SKIP_SWEEP" -eq 0 ]; then
         echo "bmc_sweep=${SWEEP_MODELS[*]}"
     else
@@ -246,7 +256,8 @@ for j in "${!JOB_MODEL[@]}"; do
                  --horizons $HORIZONS --stride "$STRIDE" --test_years "$TEST_YEARS"
                  $tuned --energy_tool both --results_dir "$rdir" --no_plots
                  --bmc --bmc_baseline_s "$BMC_BASELINE_S"
-                 --rapl --rapl_baseline_s "$BMC_BASELINE_S")
+                 --rapl --rapl_baseline_s "$BMC_BASELINE_S"
+                 --chassis_cooldown_s "$CHASSIS_COOLDOWN_S")
         else
             # shellcheck disable=SC2086
             cmd=($PY -u run_tsfm_benchmark.py --models "$m"
@@ -254,7 +265,8 @@ for j in "${!JOB_MODEL[@]}"; do
                  --batch_size 16 --device cuda --gpu_index 0
                  --energy_tool all --results_dir "$rdir" --no_plots
                  --bmc --bmc_baseline_s "$BMC_BASELINE_S"
-                 --rapl --rapl_baseline_s "$BMC_BASELINE_S")
+                 --rapl --rapl_baseline_s "$BMC_BASELINE_S"
+                 --chassis_cooldown_s "$CHASSIS_COOLDOWN_S")
         fi
 
         if [ "$DRY_RUN" -eq 1 ]; then
@@ -286,6 +298,8 @@ for j in "${!JOB_MODEL[@]}"; do
   "repeats_total": $reps_total,
   "bmc": true,
   "bmc_baseline_s": $BMC_BASELINE_S,
+  "chassis_cooldown_s": $CHASSIS_COOLDOWN_S,
+  "job_pause_s": $JOB_PAUSE_S,
   "run_id": "$run_id",
   "run_dir": "$(realpath --relative-to="$PROJECT_DIR" "$rdir")",
   "stride": $STRIDE,
@@ -302,6 +316,12 @@ for j in "${!JOB_MODEL[@]}"; do
 JSON
 
         echo "[$(date -u +%H:%M:%S)] <<< $m $rep done (exit=$rc, $(( t1 - t0 ))s, run_id=${run_id:-none})" | tee -a "$LOG"
+
+        # Let the chassis settle before the next job's before-window.
+        if [ "$DRY_RUN" -eq 0 ] && [ "$done_n" -lt "$total" ]; then
+            echo "[$(date -u +%H:%M:%S)] ... pause ${JOB_PAUSE_S}s before the next job" | tee -a "$LOG"
+            sleep "$JOB_PAUSE_S"
+        fi
     }
 done
 

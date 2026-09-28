@@ -544,6 +544,7 @@ class BmcPowerMeter:
         baseline_after_s: float = 60.0,
         carbon_intensity_kg_per_kwh: float = _BEL_CARBON_INTENSITY,
         enabled: bool = True,
+        cooldown_s: float = 0.0,
     ):
         self.project_name = project_name
         self.output_dir = Path(output_dir)
@@ -552,6 +553,10 @@ class BmcPowerMeter:
         self.baseline_after_s = float(baseline_after_s)
         self.carbon_intensity = carbon_intensity_kg_per_kwh
         self.enabled = bool(enabled)
+        # Pause between the end of the run and the after-window, so the
+        # after-baseline is not taken while fans and GPU are still winding
+        # down. Sampled and labelled "cooldown", excluded from the baseline.
+        self.cooldown_s = max(0.0, float(cooldown_s))
 
         self._sensor: Optional[Path] = None
         self._sensor_error: Optional[str] = None
@@ -565,6 +570,7 @@ class BmcPowerMeter:
         self._run_samples: List[Tuple[float, float, float]] = []
         self._before: List[Tuple[float, float, float]] = []
         self._after: List[Tuple[float, float, float]] = []
+        self._cooldown: List[Tuple[float, float, float]] = []
         self._prev_t: Optional[float] = None
         self._thread: Optional[threading.Thread] = None
         self._stop_evt = threading.Event()
@@ -662,6 +668,7 @@ class BmcPowerMeter:
                 t0 = self._run_start or self._t0 or 0.0
                 for phase, rows in (("baseline_before", self._before),
                                     ("run", self._run_samples),
+                                    ("cooldown", self._cooldown),
                                     ("baseline_after", self._after)):
                     for ts, w, _dt in rows:
                         fh.write(f"{self.project_name},{phase},{ts:.3f},"
@@ -690,6 +697,15 @@ class BmcPowerMeter:
                 self._run_samples.append(s)
             self._run_end = time.time()
             run = list(self._run_samples)
+
+        # Cool-down: sampled for the record, never part of the baseline. A
+        # boundary sample closes it so the after-window starts at that instant.
+        self._cooldown = self._sample_window(self.cooldown_s)
+        if self.cooldown_s > 0:
+            with self._lock:
+                s = self._sample()
+                if s is not None:
+                    self._cooldown.append(s)
 
         self._after = self._sample_window(self.baseline_after_s)
 
@@ -723,6 +739,7 @@ class BmcPowerMeter:
             "bmc_run_window_s":    run_window_s,
             "bmc_baseline_before_s": self.baseline_before_s,
             "bmc_baseline_after_s":  self.baseline_after_s,
+            "bmc_cooldown_s":      self.cooldown_s,
             "bmc_poll_interval_s": self.poll_interval_s,
             "bmc_sensor":          str(self._sensor),
             "bmc_details_path":    details,
@@ -756,11 +773,13 @@ class RaplPowerMeter:
 
         start()      thread starts, phase "before"   (idle baseline)
         begin_run()  phase -> "run"                  (the workload)
-        end_run()    phase -> "after"                (idle baseline)
+        end_run()    phase -> "cooldown" for cooldown_s seconds, then "after"
+                     (straight to "after" when cooldown_s is 0)
         stop()       thread stops, statistics computed
 
     Baseline mean / std come from "before" + "after"; gross and incremental
-    energy from "run". This lets the RAPL and BMC meters share identical
+    energy from "run"; "cooldown" samples are written to the trace and used
+    for nothing else. This lets the RAPL and BMC meters share identical
     windows when the BMC meter's blocking baselines bracket the run.
     Like RAPL itself, the reading covers every process on both sockets.
     """
@@ -814,6 +833,7 @@ class RaplPowerMeter:
         baseline_after_s: float = 60.0,
         carbon_intensity_kg_per_kwh: float = _BEL_CARBON_INTENSITY,
         enabled: bool = True,
+        cooldown_s: float = 0.0,
     ):
         self.project_name = project_name
         self.output_dir = Path(output_dir)
@@ -824,6 +844,9 @@ class RaplPowerMeter:
         self.baseline_after_s = float(baseline_after_s)
         self.carbon_intensity = carbon_intensity_kg_per_kwh
         self.enabled = bool(enabled)
+        self.cooldown_s = max(0.0, float(cooldown_s))
+        self._t_cooldown_end: Optional[float] = None
+        self._t_after_start: Optional[float] = None
 
         self._sensors: List[Tuple[Path, int]] = []
         if self.enabled:
@@ -879,9 +902,20 @@ class RaplPowerMeter:
 
     def _run_loop(self) -> None:
         while not self._stop_evt.is_set():
+            wait_s = self.poll_interval_s
             with self._lock:
-                self._take_sample(self._phase)
-            self._stop_evt.wait(self.poll_interval_s)
+                if self._phase == "cooldown" and self._t_cooldown_end is not None:
+                    if time.time() >= self._t_cooldown_end:
+                        self._take_sample("cooldown")   # close "cooldown" at this instant
+                        self._phase = "after"
+                        self._t_after_start = time.time()
+                    else:
+                        self._take_sample("cooldown")
+                        # wake exactly at the switch instant
+                        wait_s = min(wait_s, max(self._t_cooldown_end - time.time(), 0.0))
+                else:
+                    self._take_sample(self._phase)
+            self._stop_evt.wait(wait_s)
 
     # --- lifecycle ---
 
@@ -909,8 +943,13 @@ class RaplPowerMeter:
             return
         with self._lock:
             self._take_sample("run")      # close "run" at this instant
-            self._phase = "after"
             self._t_run_end = time.time()
+            if self.cooldown_s > 0:
+                self._phase = "cooldown"
+                self._t_cooldown_end = self._t_run_end + self.cooldown_s
+            else:
+                self._phase = "after"
+                self._t_after_start = self._t_run_end
 
     @staticmethod
     def _integrate(samples: List[Tuple[float, float]], offset_w: float = 0.0) -> float:
@@ -957,7 +996,9 @@ class RaplPowerMeter:
             self._thread.join(timeout=max(5.0, self.poll_interval_s * 2))
 
         with self._lock:
-            self._take_sample("after")    # close "after" at this instant
+            # close the current phase at this instant ("after" in normal use;
+            # "cooldown" only if stop() arrives before the cool-down has elapsed)
+            self._take_sample("cooldown" if self._phase == "cooldown" else "after")
             self._t_end = time.time()
             samples = list(self._samples)
 
@@ -979,8 +1020,8 @@ class RaplPowerMeter:
                         if (self._t_run_start and self._t_run_end) else float("nan"))
         before_s = ((self._t_run_start - self._t0)
                     if (self._t0 and self._t_run_start) else float("nan"))
-        after_s = ((self._t_end - self._t_run_end)
-                   if (self._t_run_end and self._t_end) else float("nan"))
+        after_s = ((self._t_end - self._t_after_start)
+                   if (self._t_after_start and self._t_end) else float("nan"))
 
         details = self._write_csv(samples)
 
@@ -996,6 +1037,7 @@ class RaplPowerMeter:
             "rapl_run_window_s":    run_window_s,
             "rapl_baseline_before_s": before_s,
             "rapl_baseline_after_s":  after_s,
+            "rapl_cooldown_s":      self.cooldown_s,
             "rapl_poll_interval_s": self.poll_interval_s,
             "rapl_sensor":          ";".join(str(p) for p, _ in self._sensors),
             "rapl_details_path":    details,
