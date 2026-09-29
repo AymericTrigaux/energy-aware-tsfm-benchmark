@@ -16,3 +16,6 @@ pyarrow
 
 # Optional: progress bars
 tqdm
+
+# Plotting
+adjustText==1.4.0  # plotting only, scripts/plot_paper_v13.py
