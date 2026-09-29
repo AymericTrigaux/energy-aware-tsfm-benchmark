@@ -3,7 +3,8 @@
 
 Writes PDF (vector) and PNG (300 dpi) to figures/paper_v13/:
 
-  pareto_all_horizons        MAE against chassis marginal energy, h = 1, 4, 96
+  pareto_h96                 MAE against chassis marginal energy at h = 96 (main text)
+  pareto_h1_h4               the same at h = 1 and h = 4 (appendix)
   pretraining_amortization   lifetime energy per forecast against forecasts made
   fig_boundary               chassis, socket and tracker energy per model (appendix)
   fig_method_traces          one repeat's power traces and the cool-down curve (appendix)
@@ -15,7 +16,7 @@ printed size and saved without tight cropping.
 
 Usage:
     python scripts/plot_paper_v13.py            # all four figures
-    python scripts/plot_paper_v13.py --only a b
+    python scripts/plot_paper_v13.py --only a a2 b
 """
 from __future__ import annotations
 
@@ -96,6 +97,7 @@ PLAN = [
       "timesfm_200m", "chronos_mini", "timesfm_500m", "chronos_large", "lag_llama"]),
 ]
 LAG_LLAMA_CHASSIS_RANGE = (235_746.0, 270_912.0)   # own before-window; explicit 393 W baseline
+AMORT_YLIM = (3e-9, 1e-1)   # kWh per forecast; lower bound below 1e-8 so the Ridge floor (6.3e-9) is on the plot
 TRACE_REPEAT = "results/repeats_20260925_092952/chronos_bolt_mini/rep03/tsfm_20260925_104937"
 COOLDOWN_RUN = "results/repeats_20260928_112337/lag_llama/rep01/tsfm_20260928_112338"
 
@@ -253,55 +255,122 @@ def family_legend(fig, families, extra=(), loc="lower center", ncol=5, y=0.0):
                handletextpad=0.4, columnspacing=1.0, borderaxespad=0.2)
 
 
-# ---------------------------------------------------------------- figure a
-def fig_pareto(T: pd.DataFrame):
-    panels = [("mae_h1", "h = 1 (15 min)"), ("mae_h4", "h = 4 (1 h)"), ("mae_h96", "h = 96 (24 h)")]
-    fig, axes = plt.subplots(1, 3, figsize=(5.5, 2.3), constrained_layout=True)
-    fig.set_constrained_layout_pads(w_pad=0.02, h_pad=0.02, wspace=0.04)
+# ---------------------------------------------------------------- figure a: Pareto
+LEADER_MAX_PT = 20.0      # a label whose leader would be longer than this is dropped
+
+
+def _frontier(pts):
+    return [m for m in pts if not any(
+        (pts[o][0] <= pts[m][0] and pts[o][1] <= pts[m][1] and pts[o] != pts[m]) for o in pts if o != m)]
+
+
+def _draw_points(ax, T, col):
+    """Markers, error bars, the Lag-Llama range bar and frontier rings for one panel.
+    Returns {model: (x, y)} anchors (Lag-Llama anchored at the middle of its range)."""
     lo, hi = LAG_LLAMA_CHASSIS_RANGE
-    for ax, (col, title) in zip(axes, panels):
-        pts = {m: (T.loc[m, "x_plot"], T.loc[m, col]) for m in T.index}
-        front = [m for m in pts if not any(
-            (pts[o][0] <= pts[m][0] and pts[o][1] <= pts[m][1] and pts[o] != pts[m]) for o in pts if o != m)]
-        texts, anchors = [], []
-        for m in T.index:
-            x, y = pts[m]
-            c = FAMILY_COLOR[MODEL_FAMILY[m]]
-            mk = "o" if m in CLASSICAL else "^"
-            if m == "lag_llama":
-                ax.plot([lo, hi], [y, y], color=c, lw=2.2, solid_capstyle="butt", zorder=3)
-                ax.plot([lo], [y], marker=mk, ms=4.5, mfc=c, mec="white", mew=0.6, ls="none", zorder=4)
-                x = lo
-            elif m == "naive":
-                ax.plot([x], [y], marker=mk, ms=4.5, mfc="white", mec=c, mew=1.0, ls="none", zorder=4)
-            else:
-                if T.loc[m, "n"] > 1 and np.isfinite(T.loc[m, "chassis_std"]):
-                    ax.errorbar([x], [y], xerr=[[T.loc[m, "chassis_std"]], [T.loc[m, "chassis_std"]]],
-                                fmt="none", ecolor=c, elinewidth=0.7, capsize=1.5, capthick=0.7, zorder=3)
-                ax.plot([x], [y], marker=mk, ms=4.5, mfc=c, mec="white", mew=0.6, ls="none", zorder=4)
-            if m in front:
-                ax.plot([x], [y], marker="o", ms=9, mfc="none", mec=INK, mew=0.7, ls="none", zorder=5)
-            texts.append(SHORT[m]); anchors.append((x, y))
-        ax.set_xscale("log")
-        ax.set_xlim(0.03, 4e6)
-        ymin, ymax = T[col].min(), T[col].max()
-        ax.set_ylim(ymin - 0.10 * (ymax - ymin), ymax + 0.16 * (ymax - ymin))
-        ax.set_title(title, loc="left", pad=3)
-        ax.grid(True, which="major"); ax.grid(False, which="minor")
-        ax.tick_params(length=2.5)
-        place_labels(fig, ax, anchors, texts)
-    axes[0].set_ylabel("MAE (MW)")
-    axes[1].set_xlabel("Chassis marginal energy per forecast origin (uWh, log scale)")
-    axes[0].annotate("open marker: Naive at its socket value,\nchassis marginal below meter resolution",
-                     xy=(0.97, 0.88), xycoords="axes fraction", fontsize=5.0, color=INK2,
-                     ha="right", va="top")
+    pts = {m: (T.loc[m, "x_plot"], T.loc[m, col]) for m in T.index}
+    front = _frontier(pts)
+    anchors = {}
+    for m in T.index:
+        x, y = pts[m]
+        c = FAMILY_COLOR[MODEL_FAMILY[m]]
+        mk = "o" if m in CLASSICAL else "^"
+        if m == "lag_llama":
+            # range bar with cap ends: own before-window baseline to the 393 W baseline
+            ax.plot([lo, hi], [y, y], color=c, lw=2.6, solid_capstyle="butt", zorder=3)
+            ax.plot([lo, hi], [y, y], ls="none", marker="|", ms=11, mew=0.9, color=c, zorder=4)
+            x = float(np.sqrt(lo * hi))
+            ax.plot([x], [y], marker=mk, ms=3.6, mfc=c, mec="white", mew=0.5, ls="none", zorder=5)
+        elif m == "naive":
+            ax.plot([x], [y], marker=mk, ms=4.8, mfc="white", mec=c, mew=1.1, ls="none", zorder=4)
+        else:
+            if T.loc[m, "n"] > 1 and np.isfinite(T.loc[m, "chassis_std"]):
+                sd = T.loc[m, "chassis_std"]
+                ax.errorbar([x], [y], xerr=[[sd], [sd]], fmt="none", ecolor=c,
+                            elinewidth=0.7, capsize=1.5, capthick=0.7, zorder=3)
+            ax.plot([x], [y], marker=mk, ms=4.8, mfc=c, mec="white", mew=0.6, ls="none", zorder=4)
+        if m in front:
+            ax.plot([x], [y], marker="o", ms=9.5, mfc="none", mec=INK, mew=0.7, ls="none", zorder=5)
+        anchors[m] = (x, y)
+    ax.set_xscale("log")
+    ax.set_xlim(0.03, 6e6)
+    ymin, ymax = T[col].min(), T[col].max()
+    ax.set_ylim(ymin - 0.10 * (ymax - ymin), ymax + 0.12 * (ymax - ymin))
+    ax.grid(True, which="major"); ax.grid(False, which="minor")
+    ax.tick_params(length=2.5)
+    return anchors, front
+
+
+def _label_points(fig, ax, anchors, which, names, fontsize=6.0, ringed=()):
+    """Label the given models with adjustText; draw a hairline leader when the label
+    sits 4 pt or more from its marker; drop the label when the leader would exceed
+    LEADER_MAX_PT. Returns the list of dropped models."""
+    from adjustText import adjust_text
+    models = [m for m in anchors if m in which]
+    texts = [ax.text(anchors[m][0], anchors[m][1], names[m], fontsize=fontsize, color=INK, zorder=6,
+                     ha="center", va="center",
+                     path_effects=[pe.withStroke(linewidth=1.6, foreground="white")]) for m in models]
+    xs = [anchors[m][0] for m in anchors]
+    ys = [anchors[m][1] for m in anchors]
+    # invisible discs the size of each marker (larger where a frontier ring is drawn)
+    sizes = [(13.0 if m in ringed else 9.5) ** 2 for m in anchors]
+    obstacles = ax.scatter(xs, ys, s=sizes, alpha=0.0, linewidths=0, zorder=0)
+    adjust_text(texts, x=xs, y=ys, objects=obstacles, ax=ax, expand=(1.10, 1.30),
+                force_text=(0.25, 0.45), force_static=(0.45, 0.65), force_pull=(0.02, 0.02),
+                max_move=(8, 8), ensure_inside_axes=True, prevent_crossings=True,
+                iter_lim=2000, time_lim=8)
+    fig.canvas.draw()
+    r = fig.canvas.get_renderer()
+    ppi = fig.dpi / 72.0
+    dropped = []
+    for m, t in zip(models, texts):
+        bb = t.get_window_extent(r)
+        px, py = ax.transData.transform(anchors[m])
+        cx = min(max(px, bb.x0), bb.x1); cy = min(max(py, bb.y0), bb.y1)   # nearest point of the label box
+        gap = float(np.hypot(px - cx, py - cy)) / ppi
+        if gap > LEADER_MAX_PT:
+            t.remove(); dropped.append(m); continue
+        if gap >= 4.0:
+            inv = ax.transData.inverted()
+            ax.annotate("", xy=anchors[m], xycoords="data", xytext=inv.transform((cx, cy)), textcoords="data",
+                        arrowprops=dict(arrowstyle="-", lw=0.35, color=INK2, shrinkA=0, shrinkB=2.8), zorder=5)
+    return dropped
+
+
+def _pareto_legend(fig, y=-0.01, ncol=6):
     extra = [Line2D([0], [0], marker="o", ls="none", ms=4.5, mfc="#BBBBBB", mec="white", label="classical"),
              Line2D([0], [0], marker="^", ls="none", ms=4.5, mfc="#BBBBBB", mec="white", label="foundation"),
              Line2D([0], [0], marker="o", ls="none", ms=8, mfc="none", mec=INK, mew=0.7, label="Pareto frontier")]
-    family_legend(fig, list(FAMILY_COLOR), extra=extra, ncol=6, y=-0.01)
-    fig.set_constrained_layout_pads(rect=(0, 0.12, 1, 1)) if False else None
-    fig.get_layout_engine().set(rect=(0, 0.11, 1, 1))
-    save(fig, "pareto_all_horizons")
+    family_legend(fig, list(FAMILY_COLOR), extra=extra, ncol=ncol, y=y)
+
+
+def fig_pareto_h96(T: pd.DataFrame):
+    """Main text: one panel, h = 96, all 15 models labelled."""
+    fig, ax = plt.subplots(figsize=(5.5, 3.4), constrained_layout=True)
+    fig.get_layout_engine().set(rect=(0, 0.115, 1, 0.885))   # (left, bottom, width, height)
+    anchors, front = _draw_points(ax, T, "mae_h96")
+    ax.set_ylabel("MAE at h = 96 (MW)")
+    ax.set_xlabel("Chassis marginal energy per forecast origin (uWh, log scale)")
+    dropped = _label_points(fig, ax, anchors, set(T.index), DISP, fontsize=6.2, ringed=front)
+    print(f"  pareto_h96: frontier = {front}; labels dropped (leader > {LEADER_MAX_PT:.0f} pt) = {dropped or 'none'}")
+    _pareto_legend(fig)
+    save(fig, "pareto_h96")
+
+
+def fig_pareto_h1_h4(T: pd.DataFrame):
+    """Appendix: h = 1 and h = 4; labels on frontier members, Naive and Lag-Llama only."""
+    fig, axes = plt.subplots(1, 2, figsize=(5.5, 2.6), constrained_layout=True, sharex=True)
+    fig.get_layout_engine().set(rect=(0, 0.15, 1, 0.85), wspace=0.04)   # (left, bottom, width, height)
+    for ax, (col, title) in zip(axes, (("mae_h1", "h = 1 (15 min)"), ("mae_h4", "h = 4 (1 h)"))):
+        anchors, front = _draw_points(ax, T, col)
+        ax.set_title(title, loc="left", pad=3)
+        ax.set_ylabel("MAE (MW)")
+        ax.set_xlabel("Chassis marginal energy (uWh per origin, log scale)", fontsize=7.5)
+        which = set(front) | {"naive", "lag_llama"}
+        dropped = _label_points(fig, ax, anchors, which, DISP, fontsize=6.0, ringed=front)
+        print(f"  pareto_h1_h4 {col}: frontier = {front}; labels dropped = {dropped or 'none'}")
+    _pareto_legend(fig)
+    save(fig, "pareto_h1_h4")
 
 
 # ---------------------------------------------------------------- figure b
@@ -333,54 +402,67 @@ def rule_table():
     return out
 
 
+# One distinct colour per line in the amortisation plot (no shared family hues here).
+# Seven Okabe and Ito hues; the eighth, yellow, does not hold on white at hairline
+# weight, so the neutral grey of the same set's companion scale takes its place.
+AMORT_COLOR = {
+    "linear": "#0072B2", "lgbm": "#009E73", "arima": "#D55E00",
+    "chronos_bolt_mini": "#CC79A7", "moirai2_small": "#E69F00", "chronos_bolt_base": "#56B4E9",
+    "chronos_large": "#000000", "lag_llama": "#7F7F7F",
+}
+AMORT_FLOORS = ["linear", "lgbm", "arima"]
+AMORT_CURVES = ["chronos_bolt_mini", "moirai2_small", "chronos_bolt_base", "chronos_large", "lag_llama"]
+
+
 def fig_amortization(T: pd.DataFrame, rules):
+    """Main text: three classical floors and five foundation curves. Seasonal Naive is
+    left out (its floor lies three decades below the rest); the other three foundation
+    curves are covered by the tables."""
     N = np.logspace(3, 12, 400)
     marg = {m: T.loc[m, "x_plot"] * 1e-9 for m in T.index}   # kWh per origin
     scen = [("A", 35_040), ("B", 3_504_000), ("C", 35_040_000)]
-    fig, ax = plt.subplots(figsize=(5.5, 3.0), constrained_layout=True)
-    fig.get_layout_engine().set(rect=(0, 0.09, 1, 1))
-    curves = {}
-    for m in ["naive", "arima", "linear", "lgbm"]:
-        c = FAMILY_COLOR[MODEL_FAMILY[m]]
-        ax.plot(N, np.full_like(N, marg[m]), color=c, lw=(1.8 if m == "lgbm" else 1.1),
-                alpha=(1 if m == "lgbm" else 0.9), zorder=(5 if m == "lgbm" else 3))
-        curves[m] = marg[m]
-    fm = [m for m in T.index if m not in CLASSICAL and m in rules]   # TimesFM has no estimate: omitted
-    for m in fm:
-        c = FAMILY_COLOR[MODEL_FAMILY[m]]
+    fig, ax = plt.subplots(figsize=(5.5, 3.2), constrained_layout=True)
+    fig.get_layout_engine().set(rect=(0, 0.08, 1, 0.92))   # (left, bottom, width, height)
+    ends = {}
+    for m in AMORT_FLOORS:
+        ax.plot(N, np.full_like(N, marg[m]), color=AMORT_COLOR[m], lw=(1.9 if m == "lgbm" else 1.2), zorder=4)
+        ends[m] = marg[m]
+    for m in AMORT_CURVES:
+        c = AMORT_COLOR[m]
         old, a, b = rules[m]
-        if m in rp.FLAGGED:          # the three rows where the accounting rules disagree
+        if m in rp.FLAGGED:
             pre, pre_hi = min(a, b), max(a, b)
-        else:                        # everything else keeps the constants used so far
+        else:
             pre = pre_hi = old
         if m == "lag_llama":
             lo, hi = (v * 1e-9 for v in LAG_LLAMA_CHASSIS_RANGE)
-            ax.fill_between(N, pre / N + lo, pre / N + hi, color=c, alpha=0.22, lw=0, zorder=2)
-            ax.plot(N, pre / N + lo, color=c, lw=1.0, ls="--", zorder=3)
-            curves[m] = pre / N[-1] + hi
+            ax.fill_between(N, pre / N + lo, pre / N + hi, color=c, alpha=0.30, lw=0, zorder=2)
+            ax.plot(N, pre / N + lo, color=c, lw=1.1, ls="--", zorder=3)
+            ax.plot(N, pre / N + hi, color=c, lw=1.1, ls="--", zorder=3)
+            ends[m] = pre / N[-1] + float(np.sqrt(lo * hi))
         elif abs(pre_hi - pre) > 1e-9:
-            ax.fill_between(N, pre / N + marg[m], pre_hi / N + marg[m], color=c, alpha=0.22, lw=0, zorder=2)
-            ax.plot(N, pre / N + marg[m], color=c, lw=1.0, ls="--", zorder=3)
-            ax.plot(N, pre_hi / N + marg[m], color=c, lw=1.0, ls="--", zorder=3)
-            curves[m] = pre_hi / N[-1] + marg[m]
+            ax.fill_between(N, pre / N + marg[m], pre_hi / N + marg[m], color=c, alpha=0.25, lw=0, zorder=2)
+            ax.plot(N, pre / N + marg[m], color=c, lw=1.1, ls="--", zorder=3)
+            ax.plot(N, pre_hi / N + marg[m], color=c, lw=1.1, ls="--", zorder=3)
+            ends[m] = pre_hi / N[-1] + marg[m]
         else:
-            ax.plot(N, pre / N + marg[m], color=c, lw=1.0, ls="--", zorder=3)
-            curves[m] = pre / N[-1] + marg[m]
+            ax.plot(N, pre / N + marg[m], color=c, lw=1.1, ls="--", zorder=3)
+            ends[m] = pre / N[-1] + marg[m]
     ax.set_xscale("log"); ax.set_yscale("log")
     ax.set_xlim(1e3, 1e12)
-    ax.set_ylim(3e-11, 3.0)
-    for sc, per_year in scen:
-        for mult, tag in ((1, "1 yr"), (30, "30 yr")):
-            nval = per_year * mult
-            ax.axvline(nval, color=INK2, ls=":", lw=0.6, alpha=0.7, zorder=1)
-            ax.annotate(f"{sc} {tag}", (nval, 2e-10), xytext=(1.5, 0), textcoords="offset points",
-                        rotation=90, va="bottom", ha="left", fontsize=5.4, color=INK2,
-                        bbox=dict(boxstyle="square,pad=0.1", fc="white", ec="none"))
-    # direct labels at the right edge, nudged apart
+    ax.set_ylim(AMORT_YLIM)
+    # scenario lines, labelled once above the top edge, horizontal, on two staggered rows
+    marks = sorted(((per_year * mult, f"{sc} {tag}") for sc, per_year in scen
+                    for mult, tag in ((1, "1 yr"), (30, "30 yr"))))
+    for i, (nval, lab) in enumerate(marks):
+        ax.axvline(nval, color=INK2, ls=":", lw=0.6, alpha=0.7, zorder=1)
+        ax.annotate(lab, xy=(nval, 1.0), xycoords=("data", "axes fraction"),
+                    xytext=(0, 2.5 + 7.0 * (i % 2)), textcoords="offset points",
+                    ha="center", va="bottom", fontsize=5.8, color=INK2, annotation_clip=False)
     texts, anchors = [], []
-    for m, yv in sorted(curves.items(), key=lambda kv: kv[1]):
-        t = ax.annotate(DISP[m], (N[-1], yv), xytext=(2.5, 0), textcoords="offset points",
-                        fontsize=5.6, va="center", color=INK, annotation_clip=False)
+    for m, yv in sorted(ends.items(), key=lambda kv: kv[1]):
+        t = ax.annotate(DISP[m], (N[-1], yv), xytext=(3, 0), textcoords="offset points",
+                        fontsize=6.0, va="center", color=INK, annotation_clip=False)
         texts.append(t); anchors.append((N[-1], yv))
     ax.set_xlabel("Forecasts made over the model's lifetime, N (log scale)")
     ax.set_ylabel("Energy per forecast (kWh, log scale)")
@@ -388,8 +470,8 @@ def fig_amortization(T: pd.DataFrame, rules):
     ax.tick_params(length=2.5)
     fig.canvas.draw()
     repel_labels(fig, ax, texts, anchors, max_shift_pt=9.0)
-    extra = [Line2D([0], [0], color=INK2, lw=1.1, label="classical: chassis marginal"),
-             Line2D([0], [0], color=INK2, lw=1.0, ls="--", label="foundation: pretraining / N + marginal"),
+    extra = [Line2D([0], [0], color=INK2, lw=1.2, label="classical: chassis marginal"),
+             Line2D([0], [0], color=INK2, lw=1.1, ls="--", label="foundation: pretraining / N + marginal"),
              Patch(facecolor="#BBBBBB", alpha=0.6, label="band: Rule A to Rule B, or baseline range")]
     fig.legend(handles=extra, loc="lower center", bbox_to_anchor=(0.5, -0.01), ncol=3,
                handletextpad=0.5, columnspacing=1.2)
@@ -524,7 +606,9 @@ def fig_method_traces():
 # ---------------------------------------------------------------- main
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--only", nargs="+", choices=["a", "b", "c", "d"], default=["a", "b", "c", "d"])
+    p.add_argument("--only", nargs="+", choices=["a", "a2", "b", "c", "d"],
+                   default=["a", "a2", "b", "c", "d"],
+                   help="a pareto_h96, a2 pareto_h1_h4, b amortisation, c boundary, d traces")
     args = p.parse_args()
     plt.rcParams.update(RC)
     T = load_table()
@@ -537,7 +621,8 @@ def main():
     for m, (old, a, b) in rules.items():
         print(f"  {DISP[m]:20s} old={old:7.2f}  A={a:7.2f}  B={'n/a' if np.isnan(b) else f'{b:7.2f}'}")
     print("  TimesFM 200M / 500M: no estimate, omitted from the figure.")
-    if "a" in args.only: fig_pareto(T)
+    if "a" in args.only: fig_pareto_h96(T)
+    if "a2" in args.only: fig_pareto_h1_h4(T)
     if "b" in args.only: fig_amortization(T, rules)
     if "c" in args.only: fig_boundary(T)
     if "d" in args.only: fig_method_traces()
