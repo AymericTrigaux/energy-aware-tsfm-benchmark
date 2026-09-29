@@ -215,7 +215,7 @@ def _plot_overlay(cc_df, nv_df, model_name, out_path, dpi=120):
 
 def cmd_measure(args: argparse.Namespace) -> None:
     from src.data import load_timeseries, clean_timeseries, split_last_n_years
-    from src.metrics import EnergyMeter, NvidiaSmiMeter
+    from src.metrics import EnergyMeter, NvidiaSmiMeter, BmcPowerMeter, RaplPowerMeter
 
     model_name   = args.model
     is_classical = model_name in _CLASSICAL_MODELS
@@ -259,6 +259,24 @@ def cmd_measure(args: argparse.Namespace) -> None:
         enabled=not args.no_nvsmi,
     )
 
+    # Optional chassis meters (additive: disabled unless --bmc / --rapl). Same
+    # phase order as the runners: RAPL samples continuously, BMC blocks on its
+    # before-window, then the run phase opens just before the trackers start.
+    chassis_tag = f"powercurve_{model_name}_{ts}_eval"
+    bmc_meter = BmcPowerMeter(
+        chassis_tag, str(run_dir),
+        baseline_before_s=args.chassis_baseline_s, baseline_after_s=args.chassis_baseline_s,
+        cooldown_s=args.chassis_cooldown_s, enabled=bool(args.bmc),
+    )
+    rapl_meter = RaplPowerMeter(
+        chassis_tag, str(run_dir),
+        baseline_before_s=args.chassis_baseline_s, baseline_after_s=args.chassis_baseline_s,
+        cooldown_s=args.chassis_cooldown_s, enabled=bool(args.rapl),
+    )
+    rapl_meter.start()
+    bmc_meter.start()
+    rapl_meter.begin_run()
+
     t0 = time.time()
     nv_meter.start()
     cc_meter.start()
@@ -275,6 +293,17 @@ def cmd_measure(args: argparse.Namespace) -> None:
     cc_result = cc_meter.stop()
     nv_result = nv_meter.stop()
     duration_s = time.time() - t0
+    rapl_meter.end_run()
+    bmc_meter.stop()          # blocks cool-down + after-window when enabled
+    rapl_meter.stop()
+    bmc_summary = bmc_meter.summary()
+    rapl_summary = rapl_meter.summary()
+    if bmc_summary:
+        print(f"  BMC : gross={bmc_summary['bmc_gross_kwh']:.3e} kWh  incremental={bmc_summary['bmc_incremental_kwh']:.3e} kWh  "
+              f"baseline={bmc_summary['bmc_baseline_w']:.1f} W  -> {run_dir / 'bmc_power.csv'}")
+    if rapl_summary:
+        print(f"  RAPL: gross={rapl_summary['rapl_gross_kwh']:.3e} kWh  incremental={rapl_summary['rapl_incremental_kwh']:.3e} kWh  "
+              f"baseline={rapl_summary['rapl_baseline_w']:.1f} W  -> {run_dir / 'rapl_power.csv'}")
 
     print(f"\nInference window: {duration_s:.1f}s, {n_done} origins")
 
@@ -312,6 +341,8 @@ def cmd_measure(args: argparse.Namespace) -> None:
                        "details_path": nv_result.details_path,
                        "gpu_index": args.gpu_index, "poll_ms": args.nvsmi_interval_ms},
         "cc_poll_interval_s": args.cc_poll_interval_s,
+        "bmc": bmc_summary,
+        "rapl": rapl_summary,
     }
     summary_path = run_dir / "summary.json"
     with open(summary_path, "w") as fh:
@@ -622,7 +653,67 @@ def cmd_composite(args: argparse.Namespace) -> None:
 
     # Scoped so the other subcommands keep matplotlib's defaults.
     with plt.rc_context(_COMPOSITE_RC):
-        _composite_figure(args, runs, ordered)
+        if getattr(args, "chassis", False):
+            _composite_figure_chassis(args, runs, ordered)
+        else:
+            _composite_figure(args, runs, ordered)
+
+
+_COMPOSITE_CHASSIS_FIGSIZE = (5.2, 6.0)
+
+
+def _composite_figure_chassis(args, runs, ordered) -> None:
+    """GPU, socket and chassis power against elapsed time, one panel each.
+
+    Socket and chassis traces come from rapl_power.csv / bmc_power.csv written by
+    `measure --bmc --rapl`; only their run-phase samples are drawn, on the same
+    elapsed axis as the nvidia-smi log (both count from the run start).
+    """
+    fig, (ax_nv, ax_rapl, ax_bmc) = plt.subplots(3, 1, figsize=_COMPOSITE_CHASSIS_FIGSIZE, sharex=True)
+    max_t = 0.0
+    for model in ordered:
+        run_dir = runs[model]
+        meta    = json.loads((run_dir / "summary.json").read_text())
+        color   = _MODEL_COLOR.get(model)
+        n       = meta.get("n_origins", "?")
+        dur     = meta.get("duration_s", 0.0)
+        label   = f"{model}  (n={n}, win={dur:.0f}s)"
+        nv_csv  = run_dir / "nvsmi_power_log.csv"
+        nv = pd.read_csv(nv_csv) if nv_csv.exists() else pd.DataFrame()
+        if not nv.empty:
+            ax_nv.plot(nv["elapsed_s"], nv["power_w"], color=color, lw=2.0, label=label, alpha=0.9)
+            max_t = max(max_t, float(nv["elapsed_s"].max()))
+        for ax, name, col in ((ax_rapl, "rapl_power.csv", "sum_w"), (ax_bmc, "bmc_power.csv", "power_w")):
+            path = run_dir / name
+            if not path.exists():
+                continue
+            t = pd.read_csv(path)
+            t = t[t["phase"] == "run"]
+            if t.empty:
+                continue
+            ax.plot(t["elapsed_s"], t[col], color=color, lw=2.0, label=label, alpha=0.9)
+            max_t = max(max_t, float(t["elapsed_s"].max()))
+    ax_nv.set_title("GPU power (nvidia-smi)");  ax_nv.set_ylabel("Power (W)");  ax_nv.grid(True, alpha=0.3)
+    ax_rapl.set_title("CPU socket power (RAPL, two packages)"); ax_rapl.set_ylabel("Power (W)"); ax_rapl.grid(True, alpha=0.3)
+    ax_bmc.set_title("Chassis power (BMC)"); ax_bmc.set_ylabel("Power (W)"); ax_bmc.grid(True, alpha=0.3)
+    ax_bmc.set_xlabel("Elapsed time (s)")
+    ax_bmc.set_xlim(left=-1, right=max_t + 1)
+    handles, labels = ax_nv.get_legend_handles_labels()
+    if not handles:
+        handles, labels = ax_bmc.get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", bbox_to_anchor=(0.5, 0.0),
+               ncols=2, frameon=False, handlelength=1.6, columnspacing=1.1)
+    fig.suptitle("Power vs time during walk-forward inference", fontweight="bold")
+    fig.tight_layout(rect=(0, 0.13, 1, 1))
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    written = []
+    for path in (out_path, out_path.with_suffix(".pdf")):
+        fig.savefig(path, dpi=args.dpi)
+        written.append(str(path))
+    plt.close(fig)
+    print(f"Composite (chassis) plot -> {', '.join(written)}  (dpi={args.dpi})")
+    print(f"Models included ({len(ordered)}): {', '.join(ordered)}")
 
 
 def _composite_figure(args, runs, ordered) -> None:
@@ -729,6 +820,14 @@ def main() -> None:
     pm.add_argument("--gpu_index", default="0")
     pm.add_argument("--no_cc", action="store_true")
     pm.add_argument("--no_nvsmi", action="store_true")
+    pm.add_argument("--bmc", action="store_true",
+                    help="Also record chassis power (BMC hwmon power_meter) around the run.")
+    pm.add_argument("--rapl", action="store_true",
+                    help="Also record socket power (RAPL package-0 + package-1) around the run.")
+    pm.add_argument("--chassis_baseline_s", type=float, default=60.0,
+                    help="Baseline window before and after the run for --bmc / --rapl.")
+    pm.add_argument("--chassis_cooldown_s", type=float, default=0.0,
+                    help="Cool-down between run end and the after-window for --bmc / --rapl.")
     pm.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     pm.add_argument("--tag", default=None)
     pm.add_argument("--no_plot", action="store_true")
@@ -748,6 +847,9 @@ def main() -> None:
     pc.add_argument("--tag", nargs="+", default=["cmp2"])
     pc.add_argument("--results_dir", default=os.environ.get("BENCH_RESULTS", "results"))
     pc.add_argument("--out", default="figures/power_curves_composite.png")
+    pc.add_argument("--chassis", action="store_true",
+                    help="Three panels: GPU (nvidia-smi), sockets (RAPL) and chassis (BMC) power, "
+                         "from runs measured with --bmc --rapl.")
     # 300 dpi for print; a sibling .pdf is written alongside the .png.
     pc.add_argument("--dpi", type=int, default=300)
 
